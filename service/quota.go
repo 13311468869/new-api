@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/userpricing"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -36,6 +37,7 @@ type QuotaInfo struct {
 	ModelPrice    float64
 	ModelRatio    float64
 	GroupRatio    float64
+	Discounts     userpricing.Discounts
 }
 
 func hasCustomModelRatio(modelName string, currentRatio float64) bool {
@@ -47,18 +49,25 @@ func hasCustomModelRatio(modelName string, currentRatio float64) bool {
 }
 
 func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
+	// 客户分项折扣（扩展）：零值视为原价
+	discounts := info.Discounts.Normalized()
 	if info.UsePrice {
 		modelPrice := decimal.NewFromFloat(info.ModelPrice)
 		quotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
 		groupRatio := decimal.NewFromFloat(info.GroupRatio)
+		fixedDiscount := decimal.NewFromFloat(discounts.Fixed)
 
-		quota := modelPrice.Mul(quotaPerUnit).Mul(groupRatio)
+		quota := modelPrice.Mul(quotaPerUnit).Mul(groupRatio).Mul(fixedDiscount)
 		return common.QuotaFromDecimalChecked(quota)
 	}
 
 	completionRatio := decimal.NewFromFloat(ratio_setting.GetCompletionRatio(info.ModelName))
 	audioRatio := decimal.NewFromFloat(ratio_setting.GetAudioRatio(info.ModelName))
 	audioCompletionRatio := decimal.NewFromFloat(ratio_setting.GetAudioCompletionRatio(info.ModelName))
+	// 注意：输入项折扣已经在 modelRatio 上体现（调用方传入的是折后模型倍率），
+	// 这里只对输出/音频两个「另行查表」的倍率补折扣。
+	outputDiscount := decimal.NewFromFloat(discounts.Output)
+	audioDiscount := decimal.NewFromFloat(discounts.Audio)
 
 	groupRatio := decimal.NewFromFloat(info.GroupRatio)
 	modelRatio := decimal.NewFromFloat(info.ModelRatio)
@@ -71,9 +80,9 @@ func calculateAudioQuota(info QuotaInfo) (int, *common.QuotaClamp) {
 
 	quota := decimal.Zero
 	quota = quota.Add(inputTextTokens)
-	quota = quota.Add(outputTextTokens.Mul(completionRatio))
-	quota = quota.Add(inputAudioTokens.Mul(audioRatio))
-	quota = quota.Add(outputAudioTokens.Mul(audioRatio).Mul(audioCompletionRatio))
+	quota = quota.Add(outputTextTokens.Mul(completionRatio).Mul(outputDiscount))
+	quota = quota.Add(inputAudioTokens.Mul(audioRatio).Mul(audioDiscount))
+	quota = quota.Add(outputAudioTokens.Mul(audioRatio).Mul(audioCompletionRatio).Mul(audioDiscount))
 
 	quota = quota.Mul(ratio)
 
@@ -108,6 +117,11 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 	audioOutTokens := usage.OutputTokenDetails.AudioTokens
 	groupRatio := ratio_setting.GetGroupRatio(relayInfo.UsingGroup)
 	modelRatio, _, _ := ratio_setting.GetModelRatio(modelName)
+	// 客户分项折扣（扩展）：预扣阶段还没走 PriceData，这里直接折到模型倍率上
+	discounts := userpricing.GetDiscounts(relayInfo.UserId, modelName)
+	if !discounts.IsNeutral() {
+		modelRatio = discounts.ApplyInput(modelRatio)
+	}
 
 	autoGroup, exists := common.GetContextKey(ctx, constant.ContextKeyAutoGroup)
 	if exists {
@@ -135,6 +149,7 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 		UsePrice:   relayInfo.UsePrice,
 		ModelRatio: modelRatio,
 		GroupRatio: actualGroupRatio,
+		Discounts:  discounts,
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -199,6 +214,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		UsePrice:   usePrice,
 		ModelRatio: modelRatio,
 		GroupRatio: groupRatio,
+		Discounts:  userpricing.GetDiscounts(relayInfo.UserId, modelName),
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)
@@ -338,6 +354,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		UsePrice:   usePrice,
 		ModelRatio: modelRatio,
 		GroupRatio: groupRatio,
+		Discounts:  userpricing.GetDiscounts(relayInfo.UserId, billingModelName),
 	}
 
 	quota, clamp := calculateAudioQuota(quotaInfo)

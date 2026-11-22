@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/userpricing"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -417,6 +418,11 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		finalGroupRatio = userGroupRatio
 	} else {
 		finalGroupRatio = groupRatio
+	}
+
+	// 客户分项折扣（扩展）：任务/按次计费按「按次」折扣计价
+	if discounts := userpricing.GetDiscounts(task.UserId, modelName); !discounts.IsNeutral() {
+		finalGroupRatio *= discounts.Fixed
 	}
 
 	// 计算 OtherRatios 乘积（视频折扣、时长等）

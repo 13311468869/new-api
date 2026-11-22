@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/userpricing"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
@@ -73,8 +74,18 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 
 	groupRatioInfo := HandleGroupRatio(c, info)
 
+	// 客户专属分项折扣（扩展）：按模型读取该客户配置的折扣率
+	discounts := userpricing.GetDiscounts(info.UserId, billingModelName)
+
 	// Check if this model uses tiered_expr billing
 	if billing_setting.GetBillingMode(billingModelName) == billing_setting.BillingModeTieredExpr {
+		// 表达式计费无法按计费项拆分，统一按「输入」折扣处理
+		if !discounts.IsNeutral() {
+			groupRatioInfo.GroupRatio *= discounts.Input
+			if groupRatioInfo.HasSpecialRatio {
+				groupRatioInfo.GroupSpecialRatio = groupRatioInfo.GroupRatio
+			}
+		}
 		return modelPriceHelperTiered(c, info, billingModelName, promptTokens, groupRatioInfo)
 	}
 
@@ -118,6 +129,19 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		imageRatio, _ = ratio_setting.GetImageRatio(billingModelName)
 		audioRatio = ratio_setting.GetAudioRatio(billingModelName)
 		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(billingModelName)
+		// 客户分项折扣（扩展）：逐项缩放倍率，结算链路会原样继承这些字段
+		if !discounts.IsNeutral() {
+			modelRatio = discounts.ApplyInput(modelRatio)
+			completionRatio = discounts.ApplyOutput(completionRatio)
+			cacheRatio = discounts.ApplyCache(cacheRatio)
+			cacheCreationRatio = discounts.ApplyCache(cacheCreationRatio)
+			cacheCreationRatio5m = discounts.ApplyCache(cacheCreationRatio5m)
+			cacheCreationRatio1h = discounts.ApplyCache(cacheCreationRatio1h)
+			cacheCreationRatio12h = discounts.ApplyCache(cacheCreationRatio12h)
+			imageRatio = discounts.ApplyImage(imageRatio)
+			audioRatio = discounts.ApplyAudio(audioRatio)
+			audioCompletionRatio = discounts.ApplyAudio(audioCompletionRatio)
+		}
 		ratio := modelRatio * groupRatioInfo.GroupRatio
 		quota, err := common.QuotaFromFloatStrict(preConsumedTokens * ratio)
 		if err != nil {
@@ -130,6 +154,10 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	} else {
 		if meta.ImagePriceRatio != 0 {
 			modelPrice = modelPrice * meta.ImagePriceRatio
+		}
+		// 客户分项折扣（扩展）：按次固定价使用「按次」折扣
+		if !discounts.IsNeutral() {
+			modelPrice = discounts.ApplyFixed(modelPrice)
 		}
 		if _, image := info.Request.(*dto.ImageRequest); image {
 			info.ImageQuotaBeforeGroup = modelPrice * common.QuotaPerUnit
@@ -239,6 +267,15 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hostt
 	var quota int
 	freeModel := false
 
+	// 客户专属分项折扣（扩展）：按次固定价用「按次」折扣，按量计费用「输入」折扣
+	discounts := userpricing.GetDiscounts(info.UserId, info.GetBillingModelName())
+	if !discounts.IsNeutral() {
+		if usePrice {
+			modelPrice = discounts.ApplyFixed(modelPrice)
+		} else {
+			modelRatio = discounts.ApplyInput(modelRatio)
+		}
+	}
 	if usePrice {
 		var err error
 		quota, err = common.QuotaFromFloatStrict(modelPrice * common.QuotaPerUnit * groupRatioInfo.GroupRatio)

@@ -148,6 +148,9 @@ func SetApiRouter(router *gin.Engine) {
 				// Custom OAuth bindings
 				selfRoute.GET("/oauth/bindings", controller.GetUserOAuthBindings)
 				selfRoute.DELETE("/oauth/bindings/:provider_id", controller.UnbindCustomOAuth)
+
+				// 客户专属模型折扣（只读）
+				selfRoute.GET("/pricing/discounts", controller.GetSelfModelDiscounts)
 			}
 
 			adminRoute := userRoute.Group("/")
@@ -170,6 +173,10 @@ func SetApiRouter(router *gin.Engine) {
 				// Admin 2FA routes
 				adminRoute.GET("/2fa/stats", controller.Admin2FAStats)
 				adminRoute.DELETE("/:id/2fa", controller.AdminDisable2FA)
+
+				// 客户专属模型折扣（管理端读写）
+				adminRoute.GET("/:id/pricing/discounts", controller.AdminGetUserModelDiscounts)
+				adminRoute.PUT("/:id/pricing/discounts", controller.AdminUpdateUserModelDiscounts)
 			}
 		}
 
