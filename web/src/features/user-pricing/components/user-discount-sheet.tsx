@@ -16,8 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Plus, Save, Star, Trash2 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { AlertTriangle, Plus, Save, Star, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -27,7 +27,9 @@ import {
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
 import { Button } from '@/components/ui/button'
+import { Combobox } from '@/components/ui/combobox'
 import { Input } from '@/components/ui/input'
+import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import {
   Sheet,
   SheetContent,
@@ -100,9 +102,20 @@ function clampPercent(value: number): number {
 
 export function UserDiscountSheet(props: Props) {
   const { t } = useTranslation()
+  const { models } = usePricingData()
   const [rows, setRows] = useState<EditableRow[]>([])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
+
+  const modelNames = useMemo(
+    () => models.map((model) => model.model_name).sort(),
+    [models]
+  )
+  const knownNames = useMemo(() => new Set(modelNames), [modelNames])
+  const modelOptions = useMemo(
+    () => modelNames.map((name) => ({ value: name, label: name })),
+    [modelNames]
+  )
 
   const load = useCallback(async () => {
     if (!props.user?.id) return
@@ -213,12 +226,15 @@ export function UserDiscountSheet(props: Props) {
               {rows.map((row) => (
                 <div key={row.key} className='bg-background/60 rounded-xl border p-3'>
                   <div className='flex items-center gap-2'>
-                    <Input
+                    <Combobox
+                      options={modelOptions}
                       value={row.model_name}
-                      onChange={(e) =>
-                        updateRow(row.key, { model_name: e.target.value })
+                      onValueChange={(value) =>
+                        updateRow(row.key, { model_name: value ?? '' })
                       }
                       placeholder={t('模型名，例如 gpt-4o；* 表示全部模型')}
+                      searchPlaceholder={t('搜索或直接输入模型名')}
+                      allowCustomValue
                       className='flex-1 font-mono'
                     />
                     <Button
@@ -237,6 +253,14 @@ export function UserDiscountSheet(props: Props) {
                       ? t('该客户所有模型的默认折扣')
                       : t('仅对该模型生效的折扣')}
                   </div>
+                  {row.model_name !== WILDCARD_MODEL &&
+                    row.model_name.trim() !== '' &&
+                    !knownNames.has(row.model_name.trim()) && (
+                      <p className='text-destructive mt-1 flex items-center gap-1 text-xs'>
+                        <AlertTriangle className='h-3.5 w-3.5' />
+                        {t('系统中不存在该模型名，这条折扣不会生效')}
+                      </p>
+                    )}
                   <div className='mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3'>
                     {DISCOUNT_ITEMS.map((item) => (
                       <label key={item.key} className='space-y-1'>

@@ -284,6 +284,15 @@ export interface LogOtherData {
   model_price?: number
   group_ratio?: number
   user_group_ratio?: number
+  // 客户专属分项折扣（1 表示原价），由后端在 tiered_expr / 倍率模型下写入
+  user_discounts?: {
+    input?: number
+    output?: number
+    cache?: number
+    image?: number
+    audio?: number
+    fixed?: number
+  }
   cache_ratio?: number
   cache_creation_ratio?: number
   cache_creation_ratio_5m?: number

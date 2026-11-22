@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/pkg/userpricing"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -306,7 +307,16 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		} else {
 			facts = provider.ExtractUsageFacts(c, info)
 		}
-		cost, trace, runErr := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
+		// 客户专属分项折扣（扩展）：按秒/按次任务走「按次」折扣，
+			// 同样通过改写表达式系数实现，预扣、结算与账单展示同口径。
+			if discounts := userpricing.GetDiscounts(info.UserId, modelName); !discounts.IsNeutral() {
+				if discounted, derr := userpricing.DiscountedBillingExpr(exprStr, discounts); derr == nil {
+					exprStr = discounted
+				} else {
+					logger.LogWarn(c, "apply user discounts to task billing expr failed: model=%s err=%v", modelName, derr)
+				}
+			}
+			cost, trace, runErr := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
 		if runErr != nil || cost < 0 {
 			if runErr == nil {
 				runErr = fmt.Errorf("negative task expression result")

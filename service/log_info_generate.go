@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/userpricing"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -357,6 +358,19 @@ func InjectTieredBillingInfo(other *model.LogOther, relayInfo *relaycommon.Relay
 	}
 	other.SetPublic("billing_mode", "tiered_expr")
 	other.SetPublic("expr_b64", base64.StdEncoding.EncodeToString([]byte(snap.ExprString)))
+	// 客户专属分项折扣（扩展）：与分组倍率分开展示，避免折扣被折叠进倍率里看不清
+	if relayInfo.UserId > 0 {
+		if discounts := userpricing.GetDiscounts(relayInfo.UserId, snap.ModelName); !discounts.IsNeutral() {
+			other.SetPublic("user_discounts", map[string]float64{
+				"input":  discounts.Input,
+				"output": discounts.Output,
+				"cache":  discounts.Cache,
+				"image":  discounts.Image,
+				"audio":  discounts.Audio,
+				"fixed":  discounts.Fixed,
+			})
+		}
+	}
 	if result != nil {
 		if tokens := result.BillingTokens; tokens != nil && result.BillingUnit == billingexpr.BillingUnitToken {
 			other.SetPublic("image_cache_tokens", tokens.ImgCR)

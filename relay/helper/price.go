@@ -79,13 +79,8 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 
 	// Check if this model uses tiered_expr billing
 	if billing_setting.GetBillingMode(billingModelName) == billing_setting.BillingModeTieredExpr {
-		// 表达式计费无法按计费项拆分，统一按「输入」折扣处理
-		if !discounts.IsNeutral() {
-			groupRatioInfo.GroupRatio *= discounts.Input
-			if groupRatioInfo.HasSpecialRatio {
-				groupRatioInfo.GroupSpecialRatio = groupRatioInfo.GroupRatio
-			}
-		}
+		// 表达式计费的单价写在系数里，无法乘到 GroupRatio 上；
+		// 折扣会在 modelPriceHelperTiered 里按计费项改写表达式系数。
 		return modelPriceHelperTiered(c, info, billingModelName, promptTokens, groupRatioInfo)
 	}
 
@@ -382,6 +377,15 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 	exprStr, ok := billing_setting.GetBillingExpr(billingModelName)
 	if !ok {
 		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)
+	}
+	// 客户专属分项折扣（扩展）：表达式计费的单价写在系数里，这里按计费项
+	// 改写系数，得到折后表达式。预扣、结算、账单展示共用同一条表达式。
+	if discounts := userpricing.GetDiscounts(info.UserId, billingModelName); !discounts.IsNeutral() {
+		if discounted, err := userpricing.DiscountedBillingExpr(exprStr, discounts); err == nil {
+			exprStr = discounted
+		} else {
+			logger.LogWarn(c, "apply user discounts to billing expr failed: model=%s err=%v", billingModelName, err)
+		}
 	}
 	exprHash := billingexpr.ExprHashString(exprStr)
 	usedVars := billingexpr.UsedVarsByHash(exprStr, exprHash)

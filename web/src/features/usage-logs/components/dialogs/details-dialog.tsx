@@ -252,6 +252,28 @@ function BillingBreakdown(props: {
     })
   }
 
+  // 客户专属分项折扣：单独一行，避免和分组倍率混在一起看不清
+  if (other.user_discounts) {
+    const labels: { key: keyof NonNullable<typeof other.user_discounts>; label: string }[] = [
+      { key: 'input', label: t('Input') },
+      { key: 'output', label: t('Output') },
+      { key: 'cache', label: t('Cache Read') },
+      { key: 'image', label: t('Image input') },
+      { key: 'audio', label: t('Audio input') },
+      { key: 'fixed', label: t('Per Request') },
+    ]
+    const parts = labels
+      .map(({ key, label }) => {
+        const rate = other.user_discounts?.[key]
+        if (rate == null || !Number.isFinite(rate) || rate >= 1) return null
+        return `${label} ${Math.round(rate * 1000) / 100}折`
+      })
+      .filter((part): part is string => Boolean(part))
+    if (parts.length > 0) {
+      rows.push({ label: t('Customer Discount'), value: parts.join(' · ') })
+    }
+  }
+
   if (
     !isTieredExpr &&
     (isClaude || hasCacheWrite12h) &&
