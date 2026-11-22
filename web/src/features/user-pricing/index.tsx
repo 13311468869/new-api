@@ -16,8 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Search } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { ChevronDown, ChevronRight, Search } from 'lucide-react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Main } from '@/components/layout'
@@ -25,9 +25,13 @@ import { Combobox } from '@/components/ui/combobox'
 import { QUOTA_TYPE_VALUES } from '@/features/pricing/constants'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import { parseTiersFromExpr } from '@/features/pricing/lib/billing-expr'
-import type { ParsedTier } from '@/features/pricing/lib/billing-expr'
+import type { ParsedTaskTier, ParsedTier } from '@/features/pricing/lib/billing-expr'
+import type { BillingUsageSchema } from '@/features/pricing/types'
 import { formatBillingCondition } from '@/features/pricing/lib/billing-expression/condition-display'
 import { getConfiguredGroupRatio } from '@/features/pricing/lib/model-helpers'
+import { getTaskNumberFields } from '@/features/pricing/lib/task-expr'
+import { getTaskPricingDisplayTiers } from '@/features/pricing/lib/task-matrix-display'
+import { taskTierConditions } from '@/features/pricing/lib/task-price-display'
 import type { PricingModel } from '@/features/pricing/types'
 import { useProfile } from '@/features/profile/hooks'
 import { formatBillingCurrencyFromUSD, getCurrencyLabel } from '@/lib/currency'
@@ -180,6 +184,8 @@ interface PriceSet {
   cacheCreate?: PriceItem
   image?: PriceItem
   audio?: PriceItem
+  /** 任务计费按秒单价（视频/音频生成） */
+  second?: PriceItem
   fixed?: PriceItem
 }
 
@@ -306,8 +312,28 @@ function buildTierPrices(
   return prices
 }
 
-/** 把 p / len 的阈值条件拼成「总 Token 数 ≥ 0；总 Token 数 ≤ 1000000」 */
-function conditionText(tier: ParsedTier, locale: string): string | undefined {
+/** 任务计费模型（视频/图片生成）：按「秒」等用量字段计价，折扣走「按次」项 */
+function buildTaskTierPrices(
+  tier: ParsedTaskTier,
+  schema: BillingUsageSchema,
+  record: ModelDiscountRecord,
+  groupRatio: number
+): PriceSet {
+  const prices: PriceSet = {}
+  for (const [field, definition] of getTaskNumberFields(schema)) {
+    if (definition.unit !== 'second') continue
+    const value = finiteNumber(tier.unitPrices[field])
+    if (value == null || value < 0) continue
+    prices.second = scaled(value, groupRatio, record.discount_fixed)
+    break
+  }
+  if (tier.constant > 0) {
+    prices.fixed = scaled(tier.constant, groupRatio, record.discount_fixed)
+  }
+  return prices
+}
+
+/** 把 p / len 的阈值条件拼成「总 Token 数 ≥ 0；总 Token 数 ≤ 1000000」 */function conditionText(tier: ParsedTier, locale: string): string | undefined {
   const list = tier.conditions ?? []
   if (list.length > 0) {
     return list
@@ -355,6 +381,24 @@ function buildLines(
 ): LineData[] {
   const groupRatio = getConfiguredGroupRatio(model.group_ratio ?? {}, group)
 
+  const schema = model.billing_usage_schema
+  if (
+    model.billing_mode === 'tiered_expr' &&
+    model.billing_expr &&
+    schema &&
+    Object.keys(schema).length > 0
+  ) {
+    const taskTiers = getTaskPricingDisplayTiers(model.billing_expr, schema)
+    if (taskTiers.length > 0) {
+      return taskTiers.map((tier, index) => ({
+        key: `task-${index}`,
+        condition:
+          taskTierConditions(tier, schema, locale, translate) || undefined,
+        prices: buildTaskTierPrices(tier, schema, record, groupRatio),
+      }))
+    }
+  }
+
   if (model.billing_mode === 'tiered_expr' && model.billing_expr) {
     const tiers = parseTiersFromExpr(model.billing_expr)
     if (tiers.length > 0) {
@@ -400,6 +444,7 @@ export function MyPricing() {
   const [category, setCategory] = useState<Category>('all')
   const [keyword, setKeyword] = useState('')
   const [vendor, setVendor] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -499,6 +544,11 @@ export function MyPricing() {
     [linesByModel]
   )
 
+  const showToken = allLines.some(
+    (line) => line.prices.input || line.prices.output || line.prices.cache
+  )
+  const showSecond = allLines.some((line) => line.prices.second)
+  const showFixed = allLines.some((line) => line.prices.fixed)
   const showCreateCache = allLines.some((line) => line.prices.cacheCreate)
   const showImage = allLines.some((line) => line.prices.image)
   const showAudio = allLines.some((line) => line.prices.audio)
@@ -586,24 +636,28 @@ export function MyPricing() {
                       <thead>
                         <tr className='text-foreground border-b text-xs font-medium'>
                           <th className='px-4 py-3 text-left'>{t('模型')}</th>
-                          <th className='px-4 py-3 text-right whitespace-nowrap'>
-                            {t('输入')}
-                            <div className='text-muted-foreground text-[11px] font-normal'>
-                              {getCurrencyLabel()}/M Token
-                            </div>
-                          </th>
-                          <th className='px-4 py-3 text-right whitespace-nowrap'>
-                            {t('输出')}
-                            <div className='text-muted-foreground text-[11px] font-normal'>
-                              {getCurrencyLabel()}/M Token
-                            </div>
-                          </th>
-                          <th className='px-4 py-3 text-right whitespace-nowrap'>
-                            {t('输入（缓存命中）')}
-                            <div className='text-muted-foreground text-[11px] font-normal'>
-                              {getCurrencyLabel()}/M Token
-                            </div>
-                          </th>
+                          {showToken && (
+                            <>
+                              <th className='px-4 py-3 text-right whitespace-nowrap'>
+                                {t('输入')}
+                                <div className='text-muted-foreground text-[11px] font-normal'>
+                                  {getCurrencyLabel()}/M Token
+                                </div>
+                              </th>
+                              <th className='px-4 py-3 text-right whitespace-nowrap'>
+                                {t('输出')}
+                                <div className='text-muted-foreground text-[11px] font-normal'>
+                                  {getCurrencyLabel()}/M Token
+                                </div>
+                              </th>
+                              <th className='px-4 py-3 text-right whitespace-nowrap'>
+                                {t('输入（缓存命中）')}
+                                <div className='text-muted-foreground text-[11px] font-normal'>
+                                  {getCurrencyLabel()}/M Token
+                                </div>
+                              </th>
+                            </>
+                          )}
                           {showCreateCache && (
                             <th className='px-4 py-3 text-right whitespace-nowrap'>
                               {t('显式缓存创建')}
@@ -628,90 +682,148 @@ export function MyPricing() {
                               </div>
                             </th>
                           )}
-                          <th className='px-4 py-3 text-right whitespace-nowrap'>
-                            {t('按次')}
-                            <div className='text-muted-foreground text-[11px] font-normal'>
-                              {getCurrencyLabel()}/{t('次')}
-                            </div>
-                          </th>
+                          {showSecond && (
+                            <th className='px-4 py-3 text-right whitespace-nowrap'>
+                              {t('按秒')}
+                              <div className='text-muted-foreground text-[11px] font-normal'>
+                                {getCurrencyLabel()}/{t('秒')}
+                              </div>
+                            </th>
+                          )}
+                          {showFixed && (
+                            <th className='px-4 py-3 text-right whitespace-nowrap'>
+                              {t('按次')}
+                              <div className='text-muted-foreground text-[11px] font-normal'>
+                                {getCurrencyLabel()}/{t('次')}
+                              </div>
+                            </th>
+                          )}
+                          <th className='w-24 px-3 py-3' />
                         </tr>
                       </thead>
                       <tbody className='divide-y'>
-                        {list.flatMap((row) => {
+                        {list.map((row) => {
                           const lines =
                             linesByModel.get(row.model.model_name) ?? []
-                          return lines.map((line, index) => (
-                            <tr
-                              key={`${row.model.model_name}-${line.key}`}
-                              className={cn(
-                                'hover:bg-muted/25',
-                                line.peak &&
-                                  'bg-amber-500/10 hover:bg-amber-500/15'
+                          const first = lines[0]
+                          const extra = lines.slice(1)
+                          const open = Boolean(
+                            expanded[row.model.model_name]
+                          )
+                          const priceCells = (prices: PriceSet) => (
+                            <>
+                              {showToken && (
+                                <>
+                                  <td className='px-4 py-3 text-right'>
+                                    <PriceWithDiscount item={prices.input} />
+                                  </td>
+                                  <td className='px-4 py-3 text-right'>
+                                    <PriceWithDiscount item={prices.output} />
+                                  </td>
+                                  <td className='px-4 py-3 text-right'>
+                                    <PriceWithDiscount item={prices.cache} />
+                                  </td>
+                                </>
                               )}
-                            >
-                              <td className='px-4 py-3 align-middle'>
-                                {line.peak ? (
-                                  <div className='flex flex-wrap items-center gap-x-2 gap-y-1'>
-                                    <span className='rounded bg-amber-500/20 px-1.5 py-[1px] text-[11px] font-medium text-amber-700 dark:text-amber-400'>
-                                      {t('高峰期')}
-                                    </span>
-                                    <span className='text-xs text-amber-700 dark:text-amber-400'>
-                                      {line.condition}
-                                    </span>
-                                  </div>
-                                ) : (
-                                  <div className='min-w-0'>
-                                    <div className='flex items-center gap-2'>
-                                      <span
-                                        className={cn(
-                                          'truncate',
-                                          index === 0
-                                            ? 'text-sm font-semibold'
-                                            : 'text-sm'
-                                        )}
-                                      >
-                                        {row.model.model_name}
-                                      </span>
-                                    </div>
-                                    {line.condition && (
-                                      <p className='text-muted-foreground mt-0.5 truncate text-xs'>
-                                        {t('适用条件')}：{line.condition}
-                                      </p>
-                                    )}
-                                  </div>
-                                )}
-                              </td>
-                              <td className='px-4 py-3 text-right'>
-                                <PriceWithDiscount item={line.prices.input} />
-                              </td>
-                              <td className='px-4 py-3 text-right'>
-                                <PriceWithDiscount item={line.prices.output} />
-                              </td>
-                              <td className='px-4 py-3 text-right'>
-                                <PriceWithDiscount item={line.prices.cache} />
-                              </td>
                               {showCreateCache && (
                                 <td className='px-4 py-3 text-right'>
-                                  <PriceWithDiscount
-                                    item={line.prices.cacheCreate}
-                                  />
+                                  <PriceWithDiscount item={prices.cacheCreate} />
                                 </td>
                               )}
                               {showImage && (
                                 <td className='px-4 py-3 text-right'>
-                                  <PriceWithDiscount item={line.prices.image} />
+                                  <PriceWithDiscount item={prices.image} />
                                 </td>
                               )}
                               {showAudio && (
                                 <td className='px-4 py-3 text-right'>
-                                  <PriceWithDiscount item={line.prices.audio} />
+                                  <PriceWithDiscount item={prices.audio} />
                                 </td>
                               )}
-                              <td className='px-4 py-3 text-right'>
-                                <PriceWithDiscount item={line.prices.fixed} />
-                              </td>
-                            </tr>
-                          ))
+                              {showSecond && (
+                                <td className='px-4 py-3 text-right'>
+                                  <PriceWithDiscount item={prices.second} />
+                                </td>
+                              )}
+                              {showFixed && (
+                                <td className='px-4 py-3 text-right'>
+                                  <PriceWithDiscount item={prices.fixed} />
+                                </td>
+                              )}
+                            </>
+                          )
+                          return (
+                            <Fragment key={row.model.model_name}>
+                              <tr className='hover:bg-muted/25'>
+                                <td className='px-4 py-3 align-middle'>
+                                  <div className='min-w-0'>
+                                    <div className='flex items-center gap-2'>
+                                      <span className='truncate text-sm font-semibold'>
+                                        {row.model.model_name}
+                                      </span>
+                                    </div>
+                                    <p className='text-muted-foreground truncate text-xs'>
+                                      {row.model.model_name}
+                                    </p>
+                                    {first?.condition && (
+                                      <p className='text-muted-foreground mt-0.5 truncate text-xs'>
+                                        {t('适用条件')}：{first.condition}
+                                      </p>
+                                    )}
+                                  </div>
+                                </td>
+                                {priceCells(first?.prices ?? {})}
+                                <td className='px-3 py-3 text-right'>
+                                  {extra.length > 0 && (
+                                    <button
+                                      type='button'
+                                      onClick={() =>
+                                        setExpanded((prev) => ({
+                                          ...prev,
+                                          [row.model.model_name]: !prev[
+                                            row.model.model_name
+                                          ],
+                                        }))
+                                      }
+                                      className='text-muted-foreground hover:text-foreground inline-flex items-center gap-1 text-xs'
+                                    >
+                                      {open ? (
+                                        <ChevronDown className='size-3.5' />
+                                      ) : (
+                                        <ChevronRight className='size-3.5' />
+                                      )}
+                                      {t('阶梯')}
+                                    </button>
+                                  )}
+                                </td>
+                              </tr>
+                              {open &&
+                                extra.map((line, index) => (
+                                  <tr
+                                    key={`${row.model.model_name}-${line.key}`}
+                                    className={cn(
+                                      'bg-violet-500/[0.06]',
+                                      line.peak && 'bg-amber-500/10'
+                                    )}
+                                  >
+                                    <td className='px-4 py-2.5 align-middle'>
+                                      <div className='min-w-0 pl-2'>
+                                        <span className='text-xs font-medium'>
+                                          {t('第 {{tier}} 档', { tier: index + 1 })}
+                                        </span>
+                                        {line.condition && (
+                                          <p className='text-muted-foreground mt-0.5 truncate text-xs'>
+                                            {t('适用条件')}：{line.condition}
+                                          </p>
+                                        )}
+                                      </div>
+                                    </td>
+                                    {priceCells(line.prices)}
+                                    <td className='px-3 py-2.5' />
+                                  </tr>
+                                ))}
+                            </Fragment>
+                          )
                         })}
                       </tbody>
                     </table>
