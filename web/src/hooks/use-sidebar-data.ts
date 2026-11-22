@@ -32,6 +32,7 @@ import {
   ServerCog,
   Settings,
   ShieldCheck,
+  Tags,
   Ticket,
   User,
   Users,
@@ -121,6 +122,12 @@ export function useSidebarData(badges: SidebarBadges = {}): SidebarData {
             title: t('Profile'),
             url: '/profile',
             icon: User,
+          },
+          {
+            // 客户专属定价（扩展）
+            title: t('我的定价'),
+            url: '/my-pricing',
+            icon: Tags,
           },
           {
             title: t('Security & Access'),
