@@ -24,6 +24,9 @@ import { Main } from '@/components/layout'
 import { Combobox } from '@/components/ui/combobox'
 import { QUOTA_TYPE_VALUES } from '@/features/pricing/constants'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
+import { parseTiersFromExpr } from '@/features/pricing/lib/billing-expr'
+import type { ParsedTier } from '@/features/pricing/lib/billing-expr'
+import { formatBillingCondition } from '@/features/pricing/lib/billing-expression/condition-display'
 import { getConfiguredGroupRatio } from '@/features/pricing/lib/model-helpers'
 import type { PricingModel } from '@/features/pricing/types'
 import { useProfile } from '@/features/profile/hooks'
@@ -48,6 +51,34 @@ const CATEGORY_TABS: { key: Category; label: string }[] = [
   { key: 'video', label: '视频' },
 ]
 
+const CONDITION_VAR_LABELS: Record<string, string> = {
+  p: '输入 Token',
+  c: '输出 Token',
+  len: '总 Token 数',
+}
+
+const OPERATOR_LABELS: Record<string, string> = {
+  '>=': '≥',
+  '<=': '≤',
+  '>': '>',
+  '<': '<',
+}
+
+/** 常见时区的中文别名，避免直接露出 IANA 标识 */
+const TIMEZONE_LABELS: Record<string, string> = {
+  'Asia/Shanghai': '北京时间',
+  UTC: 'UTC',
+  'Asia/Tokyo': '日本时间',
+  'Asia/Seoul': '首尔时间',
+  'Asia/Singapore': '新加坡时间',
+  'Europe/London': '伦敦时间',
+  'Europe/Berlin': '柏林时间',
+  'America/New_York': '纽约时间',
+  'America/Chicago': '芝加哥时间',
+  'America/Los_Angeles': '洛杉矶时间',
+  'Australia/Sydney': '悉尼时间',
+}
+
 function categoryOf(model: PricingModel): Exclude<Category, 'all'> {
   const mods = new Set<string>([
     ...(model.input_modalities ?? []),
@@ -55,7 +86,9 @@ function categoryOf(model: PricingModel): Exclude<Category, 'all'> {
   ])
   if (mods.has('video')) return 'video'
   if (mods.has('image')) {
-    return model.quota_type === QUOTA_TYPE_VALUES.REQUEST ? 'image' : 'multimodal'
+    return model.quota_type === QUOTA_TYPE_VALUES.REQUEST
+      ? 'image'
+      : 'multimodal'
   }
   if (mods.has('audio')) return 'multimodal'
   return 'text'
@@ -101,9 +134,24 @@ function money(value: number | undefined): string {
   })
 }
 
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/** 0 与缺省不同：表达式里显式写 0 代表免费 */
+function scaled(
+  value: number | undefined,
+  groupRatio: number,
+  discount: number
+): PriceItem | undefined {
+  if (value == null) return undefined
+  const original = value * groupRatio
+  return { original, discounted: original * discount, rate: discount }
+}
+
 type PriceItem = { original: number; discounted: number; rate: number }
 
-/** 折后价 + 绿色折扣标签 */
+/** 折后价 + 绿色折扣标签，原价通过悬停提示 */
 function PriceWithDiscount({ item }: { item?: PriceItem }) {
   if (!item || !Number.isFinite(item.discounted)) {
     return <span className='text-muted-foreground text-xs'>—</span>
@@ -113,7 +161,9 @@ function PriceWithDiscount({ item }: { item?: PriceItem }) {
       className='inline-flex items-center justify-end gap-1.5'
       title={`${money(item.original)}`}
     >
-      <span className='font-mono text-sm tabular-nums'>{money(item.discounted)}</span>
+      <span className='font-mono text-sm tabular-nums'>
+        {money(item.discounted)}
+      </span>
       {item.rate < 1 && (
         <span className='rounded-full border border-emerald-500/50 px-1.5 py-[1px] text-[11px] leading-4 text-emerald-600 dark:text-emerald-400'>
           {zheLabel(item.rate)}
@@ -133,77 +183,158 @@ interface PriceSet {
   fixed?: PriceItem
 }
 
-function buildPrices(
+/** 传统倍率模型的单价：model_ratio × 2 × 分组倍率 */
+function buildRatioPrices(
   model: PricingModel,
   record: ModelDiscountRecord,
-  group: string
+  groupRatio: number
 ): PriceSet {
-  const groupRatio = getConfiguredGroupRatio(model.group_ratio ?? {}, group)
-
   if (model.quota_type === QUOTA_TYPE_VALUES.REQUEST) {
-    const original = (model.model_price ?? 0) * groupRatio
     return {
-      fixed: {
-        original,
-        discounted: original * record.discount_fixed,
-        rate: record.discount_fixed,
-      },
+      fixed: scaled(model.model_price ?? 0, groupRatio, record.discount_fixed),
     }
   }
 
-  const base = (model.model_ratio ?? 0) * 2 * groupRatio
-  const inputRate = record.discount_input
-  const prices: PriceSet = {
-    input: { original: base, discounted: base * inputRate, rate: inputRate },
+  const inputUnit = (model.model_ratio ?? 0) * 2 * groupRatio
+  const inputItem: PriceItem = {
+    original: inputUnit,
+    discounted: inputUnit * record.discount_input,
+    rate: record.discount_input,
   }
+  const prices: PriceSet = { input: inputItem }
 
   if (Number.isFinite(model.completion_ratio)) {
     const ratio = Number(model.completion_ratio)
     prices.output = {
-      original: base * ratio,
-      discounted: base * inputRate * ratio * record.discount_output,
+      original: inputUnit * ratio,
+      discounted:
+        inputUnit * record.discount_input * ratio * record.discount_output,
       rate: record.discount_output,
     }
   }
 
-  const cacheRatio = model.cache_ratio == null ? NaN : Number(model.cache_ratio)
-  if (Number.isFinite(cacheRatio)) {
+  if (model.cache_ratio != null) {
     prices.cache = {
-      original: base * cacheRatio,
-      discounted: base * inputRate * cacheRatio * record.discount_cache,
+      original: inputUnit * Number(model.cache_ratio),
+      discounted:
+        inputUnit *
+        record.discount_input *
+        Number(model.cache_ratio) *
+        record.discount_cache,
       rate: record.discount_cache,
     }
   }
 
-  const createRatio =
-    model.create_cache_ratio == null ? NaN : Number(model.create_cache_ratio)
-  if (Number.isFinite(createRatio)) {
+  if (model.create_cache_ratio != null) {
     prices.cacheCreate = {
-      original: base * createRatio,
-      discounted: base * inputRate * createRatio * record.discount_cache,
+      original: inputUnit * Number(model.create_cache_ratio),
+      discounted:
+        inputUnit *
+        record.discount_input *
+        Number(model.create_cache_ratio) *
+        record.discount_cache,
       rate: record.discount_cache,
     }
   }
 
-  const imageRatio = model.image_ratio == null ? NaN : Number(model.image_ratio)
-  if (Number.isFinite(imageRatio)) {
+  if (model.image_ratio != null) {
     prices.image = {
-      original: base * imageRatio,
-      discounted: base * inputRate * imageRatio * record.discount_image,
+      original: inputUnit * Number(model.image_ratio),
+      discounted:
+        inputUnit *
+        record.discount_input *
+        Number(model.image_ratio) *
+        record.discount_image,
       rate: record.discount_image,
     }
   }
 
-  const audioRatio = model.audio_ratio == null ? NaN : Number(model.audio_ratio)
-  if (Number.isFinite(audioRatio)) {
+  if (model.audio_ratio != null) {
     prices.audio = {
-      original: base * audioRatio,
-      discounted: base * inputRate * audioRatio * record.discount_audio,
+      original: inputUnit * Number(model.audio_ratio),
+      discounted:
+        inputUnit *
+        record.discount_input *
+        Number(model.audio_ratio) *
+        record.discount_audio,
       rate: record.discount_audio,
     }
   }
 
   return prices
+}
+
+/** 阶梯 / 时段表达式模型：表达式里的单价本身就是每百万 Token 的美元值 */
+function buildTierPrices(
+  tier: ParsedTier,
+  record: ModelDiscountRecord,
+  groupRatio: number
+): PriceSet {
+  if (tier.billingUnit === 'request') {
+    const fixed = finiteNumber(tier.fixedPrice) ?? 0
+    return { fixed: scaled(fixed, groupRatio, record.discount_fixed) }
+  }
+
+  const input = finiteNumber(tier.inputPrice)
+  const prices: PriceSet = {}
+  if (input != null)
+    prices.input = scaled(input, groupRatio, record.discount_input)
+
+  const output = finiteNumber(tier.outputPrice)
+  if (output != null) {
+    prices.output = scaled(output, groupRatio, record.discount_output)
+  }
+
+  const cacheRead = finiteNumber(tier.cacheReadPrice)
+  if (cacheRead != null) {
+    prices.cache = scaled(cacheRead, groupRatio, record.discount_cache)
+  }
+
+  const cacheCreate = finiteNumber(tier.cacheCreatePrice)
+  if (cacheCreate != null) {
+    prices.cacheCreate = scaled(cacheCreate, groupRatio, record.discount_cache)
+  }
+
+  const image = finiteNumber(tier.imagePrice)
+  if (image != null)
+    prices.image = scaled(image, groupRatio, record.discount_image)
+
+  const audio = finiteNumber(tier.audioInputPrice)
+  if (audio != null)
+    prices.audio = scaled(audio, groupRatio, record.discount_audio)
+
+  return prices
+}
+
+/** 把 p / len 的阈值条件拼成「总 Token 数 ≥ 0；总 Token 数 ≤ 1000000」 */
+function conditionText(tier: ParsedTier, locale: string): string | undefined {
+  const list = tier.conditions ?? []
+  if (list.length > 0) {
+    return list
+      .map((condition) => {
+        const label = CONDITION_VAR_LABELS[condition.var] ?? condition.var
+        const operator = OPERATOR_LABELS[condition.op] ?? condition.op
+        return `${label} ${operator} ${condition.value.toLocaleString(locale)}`
+      })
+      .join('；')
+  }
+  return undefined
+}
+
+function timezoneLabel(text: string): string {
+  let result = text
+  for (const [key, label] of Object.entries(TIMEZONE_LABELS)) {
+    result = result.split(`(${key})`).join(`（${label}）`)
+  }
+  return result
+}
+
+type PriceLine = {
+  key: string
+  /** 该行对应的条件文案，展示为「适用条件」 */
+  condition?: string
+  /** 时段行，橙色底 + 「高峰期」标记 */
+  peak?: boolean
 }
 
 type RowData = {
@@ -212,12 +343,56 @@ type RowData = {
   matched: 'exact' | 'wildcard'
 }
 
+type LineData = PriceLine & { prices: PriceSet }
+
+/** 一个模型可能展开成多行（基础 / 阶梯 / 高峰时段） */
+function buildLines(
+  model: PricingModel,
+  record: ModelDiscountRecord,
+  group: string,
+  translate: (key: string, options?: Record<string, unknown>) => string,
+  locale: string
+): LineData[] {
+  const groupRatio = getConfiguredGroupRatio(model.group_ratio ?? {}, group)
+
+  if (model.billing_mode === 'tiered_expr' && model.billing_expr) {
+    const tiers = parseTiersFromExpr(model.billing_expr)
+    if (tiers.length > 0) {
+      const timeBased = tiers.some((tier) =>
+        (tier.conditionText ?? '').includes('hour(')
+      )
+      const maxInput = Math.max(
+        ...tiers.map((tier) => finiteNumber(tier.inputPrice) ?? 0)
+      )
+      return tiers.map((tier, index) => {
+        const rawCondition = tier.conditionText
+          ? formatBillingCondition(tier.conditionText, translate, locale)
+          : null
+        const peak =
+          timeBased &&
+          tiers.length > 1 &&
+          (finiteNumber(tier.inputPrice) ?? 0) === maxInput
+        return {
+          key: `${tier.label}-${index}`,
+          condition:
+            conditionText(tier, locale) ??
+            (rawCondition ? timezoneLabel(rawCondition) : undefined),
+          peak,
+          prices: buildTierPrices(tier, record, groupRatio),
+        }
+      })
+    }
+  }
+
+  return [{ key: 'base', prices: buildRatioPrices(model, record, groupRatio) }]
+}
+
 // ---------------------------------------------------------------------------
 // 页面
 // ---------------------------------------------------------------------------
 
 export function MyPricing() {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const { models } = usePricingData()
   const { profile } = useProfile()
   const [records, setRecords] = useState<ModelDiscountRecord[]>([])
@@ -299,11 +474,34 @@ export function MyPricing() {
     return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]))
   }, [filtered, t])
 
-  const showCreateCache = filtered.some(
-    (row) => row.model.create_cache_ratio != null
+  const linesByModel = useMemo(() => {
+    const map = new Map<string, LineData[]>()
+    for (const row of filtered) {
+      map.set(
+        row.model.model_name,
+        buildLines(
+          row.model,
+          row.discount,
+          profile?.group ?? '',
+          t as unknown as (
+            key: string,
+            options?: Record<string, unknown>
+          ) => string,
+          i18n.language
+        )
+      )
+    }
+    return map
+  }, [filtered, profile?.group, t, i18n.language])
+
+  const allLines = useMemo(
+    () => [...linesByModel.values()].flat(),
+    [linesByModel]
   )
-  const showImage = filtered.some((row) => row.model.image_ratio != null)
-  const showAudio = filtered.some((row) => row.model.audio_ratio != null)
+
+  const showCreateCache = allLines.some((line) => line.prices.cacheCreate)
+  const showImage = allLines.some((line) => line.prices.image)
+  const showAudio = allLines.some((line) => line.prices.audio)
 
   return (
     <Main>
@@ -439,56 +637,81 @@ export function MyPricing() {
                         </tr>
                       </thead>
                       <tbody className='divide-y'>
-                        {list.map((row) => {
-                          const prices = buildPrices(
-                            row.model,
-                            row.discount,
-                            profile?.group ?? ''
-                          )
-                          return (
+                        {list.flatMap((row) => {
+                          const lines =
+                            linesByModel.get(row.model.model_name) ?? []
+                          return lines.map((line, index) => (
                             <tr
-                              key={row.model.model_name}
-                              className='hover:bg-muted/25'
+                              key={`${row.model.model_name}-${line.key}`}
+                              className={cn(
+                                'hover:bg-muted/25',
+                                line.peak &&
+                                  'bg-amber-500/10 hover:bg-amber-500/15'
+                              )}
                             >
-                              <td className='px-4 py-4'>
-                                <div className='min-w-0'>
-                                  <p className='truncate text-sm font-semibold'>
-                                    {row.model.model_name}
-                                  </p>
-                                  <p className='text-muted-foreground truncate text-xs'>
-                                    {row.model.model_name}
-                                  </p>
-                                </div>
+                              <td className='px-4 py-3 align-middle'>
+                                {line.peak ? (
+                                  <div className='flex flex-wrap items-center gap-x-2 gap-y-1'>
+                                    <span className='rounded bg-amber-500/20 px-1.5 py-[1px] text-[11px] font-medium text-amber-700 dark:text-amber-400'>
+                                      {t('高峰期')}
+                                    </span>
+                                    <span className='text-xs text-amber-700 dark:text-amber-400'>
+                                      {line.condition}
+                                    </span>
+                                  </div>
+                                ) : (
+                                  <div className='min-w-0'>
+                                    <div className='flex items-center gap-2'>
+                                      <span
+                                        className={cn(
+                                          'truncate',
+                                          index === 0
+                                            ? 'text-sm font-semibold'
+                                            : 'text-sm'
+                                        )}
+                                      >
+                                        {row.model.model_name}
+                                      </span>
+                                    </div>
+                                    {line.condition && (
+                                      <p className='text-muted-foreground mt-0.5 truncate text-xs'>
+                                        {t('适用条件')}：{line.condition}
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
                               </td>
-                              <td className='px-4 py-4 text-right'>
-                                <PriceWithDiscount item={prices.input} />
+                              <td className='px-4 py-3 text-right'>
+                                <PriceWithDiscount item={line.prices.input} />
                               </td>
-                              <td className='px-4 py-4 text-right'>
-                                <PriceWithDiscount item={prices.output} />
+                              <td className='px-4 py-3 text-right'>
+                                <PriceWithDiscount item={line.prices.output} />
                               </td>
-                              <td className='px-4 py-4 text-right'>
-                                <PriceWithDiscount item={prices.cache} />
+                              <td className='px-4 py-3 text-right'>
+                                <PriceWithDiscount item={line.prices.cache} />
                               </td>
                               {showCreateCache && (
-                                <td className='px-4 py-4 text-right'>
-                                  <PriceWithDiscount item={prices.cacheCreate} />
+                                <td className='px-4 py-3 text-right'>
+                                  <PriceWithDiscount
+                                    item={line.prices.cacheCreate}
+                                  />
                                 </td>
                               )}
                               {showImage && (
-                                <td className='px-4 py-4 text-right'>
-                                  <PriceWithDiscount item={prices.image} />
+                                <td className='px-4 py-3 text-right'>
+                                  <PriceWithDiscount item={line.prices.image} />
                                 </td>
                               )}
                               {showAudio && (
-                                <td className='px-4 py-4 text-right'>
-                                  <PriceWithDiscount item={prices.audio} />
+                                <td className='px-4 py-3 text-right'>
+                                  <PriceWithDiscount item={line.prices.audio} />
                                 </td>
                               )}
-                              <td className='px-4 py-4 text-right'>
-                                <PriceWithDiscount item={prices.fixed} />
+                              <td className='px-4 py-3 text-right'>
+                                <PriceWithDiscount item={line.prices.fixed} />
                               </td>
                             </tr>
-                          )
+                          ))
                         })}
                       </tbody>
                     </table>
